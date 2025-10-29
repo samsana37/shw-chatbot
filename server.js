@@ -1,52 +1,52 @@
+// ===== 🔧 Environment Setup =====
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const fetch = require('node-fetch'); // Ensure this is installed in package.json
+const fetch = (...args) =>
+  import('node-fetch').then(({ default: fetch }) => fetch(...args));
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware
-app.use(cors());
-app.use(express.json());
-app.use(express.static('public'));
-
-// ===== 🔧 Environment & Config =====
+// ===== ⚙️ Config =====
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const OPENROUTER_URL = process.env.OPENROUTER_URL || 'https://openrouter.ai/api/v1/chat/completions';
+const MODEL = 'nvidia/nemotron-nano-9b-v2:free';
 
-// Auto-detect Vercel domain for Referer header
+// Auto-detect deployment URL (important for Vercel)
 const APP_URL = process.env.VERCEL_URL
   ? `https://${process.env.VERCEL_URL}`
   : process.env.APP_URL || 'http://localhost:3000';
 
-// ===== 🧠 AI Model & System Prompt =====
-const MODEL = 'nvidia/nemotron-nano-9b-v2:free';
 const SYSTEM_PROMPT = `You are a helpful, friendly, and knowledgeable AI assistant. 
-You provide clear, concise, and accurate responses. You're conversational but professional.
-You can help with a wide variety of topics including general knowledge, coding, writing, analysis, and more.`;
+You provide clear, concise, and accurate responses. You're conversational but professional.`;
 
-// ===== 💬 Memory & Rate Limit Handling =====
+// ===== 💬 Memory & Rate Limit =====
 const conversationHistories = new Map();
 const requestTimes = new Map();
 const MIN_REQUEST_INTERVAL = 1000;
 
+// ===== 🌐 Middleware =====
+app.use(cors());
+app.use(express.json());
+app.use(express.static('public'));
+
 // ===== 🚀 Chat Endpoint =====
 app.post('/api/chat', async (req, res) => {
   const { message, sessionId = 'default' } = req.body;
+
   if (!message) return res.status(400).json({ error: 'Message is required' });
 
+  // Basic rate limiting
   const now = Date.now();
-  const lastRequest = requestTimes.get(sessionId) || 0;
-  const elapsed = now - lastRequest;
-  if (elapsed < MIN_REQUEST_INTERVAL) {
-    const wait = Math.ceil((MIN_REQUEST_INTERVAL - elapsed) / 1000);
-    return res.status(429).json({ error: `Please wait ${wait}s before next message.` });
+  const last = requestTimes.get(sessionId) || 0;
+  if (now - last < MIN_REQUEST_INTERVAL) {
+    return res.status(429).json({ error: 'Please wait 1s between messages.' });
   }
   requestTimes.set(sessionId, now);
 
   try {
-    // Conversation context
+    // Conversation memory
     if (!conversationHistories.has(sessionId)) {
       conversationHistories.set(sessionId, [{ role: 'system', content: SYSTEM_PROMPT }]);
     }
@@ -54,9 +54,9 @@ app.post('/api/chat', async (req, res) => {
     history.push({ role: 'user', content: message });
     if (history.length > 21) history.splice(1, history.length - 21);
 
-    console.log(`📤 Sending request to OpenRouter (${MODEL})`);
+    console.log(`📤 Sending request to OpenRouter → ${MODEL}`);
 
-    // Fetch from OpenRouter
+    // Call OpenRouter API
     const response = await fetch(OPENROUTER_URL, {
       method: 'POST',
       headers: {
@@ -73,21 +73,14 @@ app.post('/api/chat', async (req, res) => {
       })
     });
 
-    const responseText = await response.text();
-    console.log(`📥 OpenRouter status: ${response.status}`);
-
+    const text = await response.text();
     if (!response.ok) {
-      let errorData;
-      try { errorData = JSON.parse(responseText); } 
-      catch { throw new Error(`HTTP ${response.status}: ${responseText}`); }
-      const errorMessage = errorData.error?.message || errorData.message || 'Unknown error';
-      throw new Error(errorMessage);
+      console.error('❌ OpenRouter error:', text);
+      return res.status(response.status).json({ error: text });
     }
 
-    const data = JSON.parse(responseText);
-    const reply = data.choices?.[0]?.message?.content;
-    if (!reply) throw new Error('Invalid response from OpenRouter');
-
+    const data = JSON.parse(text);
+    const reply = data.choices?.[0]?.message?.content || 'No response from model.';
     history.push({ role: 'assistant', content: reply });
 
     res.json({ reply, model: MODEL, timestamp: new Date().toISOString() });
@@ -97,7 +90,7 @@ app.post('/api/chat', async (req, res) => {
   }
 });
 
-// ===== 🧹 Clear, Health & Test Routes =====
+// ===== 🧹 Utility Endpoints =====
 app.post('/api/clear', (req, res) => {
   const { sessionId = 'default' } = req.body;
   conversationHistories.delete(sessionId);
@@ -108,16 +101,17 @@ app.post('/api/clear', (req, res) => {
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
-    openrouterConfigured: !!OPENROUTER_API_KEY,
+    message: 'Chatbot is running',
     model: MODEL,
-    apiKey: OPENROUTER_API_KEY ? OPENROUTER_API_KEY.slice(0, 8) + '...' : 'Not set',
+    openrouterConfigured: !!OPENROUTER_API_KEY,
+    apiKeyPrefix: OPENROUTER_API_KEY ? OPENROUTER_API_KEY.slice(0, 8) + '...' : 'Not set',
   });
 });
 
 app.get('/api/test-key', async (req, res) => {
   try {
     const r = await fetch('https://openrouter.ai/api/v1/auth/key', {
-      headers: { 'Authorization': `Bearer ${OPENROUTER_API_KEY}` }
+      headers: { Authorization: `Bearer ${OPENROUTER_API_KEY}` }
     });
     const data = await r.json();
     res.json({ valid: r.ok, status: r.status, data });
@@ -137,8 +131,6 @@ setInterval(() => {
   }
 }, 3600000);
 
-// ===== ✅ Start Server =====
-app.listen(PORT, () => {
-  console.log(`🚀 Server ready on port ${PORT}`);
-  console.log(`📍 Live URL: ${APP_URL}`);
-});
+// ===== ✅ Export for Vercel =====
+// (Do NOT use app.listen() on Vercel)
+module.exports = app;
